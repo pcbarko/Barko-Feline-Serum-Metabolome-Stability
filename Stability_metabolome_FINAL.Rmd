@@ -1,0 +1,880 @@
+---
+title: "Feline Metabolome Stability Study"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align="center")
+library(knitr)
+library(dplyr)
+library(plyr)
+library(kableExtra)
+library(pheatmap)
+library(fgsea)
+library(factoextra)
+library(EnhancedVolcano)
+library(omu)
+library(rstatix)
+library(tidyr)
+library(corrr)
+library(RColorBrewer)
+library(viridis)
+library(visdat)
+library(purrr)
+library(ggpubr)
+library(made4)
+library(qvalue)
+library(FactoMineR)
+library(reshape2)
+library(ggplus)
+library(Matrix)
+library(lme4)
+library(emmeans)
+library(ICC)
+library(randomForest)
+require(caTools)
+```
+
+#**Data Summary**
+
+These data were generated from an experiment, conducted by Anisha Jambhekar, designed to assess the stability of serum metabolites exposed to sub-optimal storage conditions. The "gold standard" for storage of biologic samples is cryogenic preservation at -80C.However, mot veterinarians lack access to cryogenic storage, limiting the application of metabolomics analsysis of samples collected and stored in a field setting. 
+
+Samples of serum from 8 healthy cats from a research colony were aliqoted and stored at -20C for 6 months, -20C for 12 months, and -80C for 12 months. After the prescribed storage period, samples kept at -20C were transfered to -80C. 
+
+Untargeted quantificaiton of serum metabolites was performed by Metabolon Inc.
+
+```{r, inlcude=F}
+
+#load scaled, imputed metabolite abundance data
+
+metab <- read.csv("feline_stab_scaledimp.csv", header = T)
+
+#relabel rows with arbitrary IDs for each metabolite 
+#removes cumbersome chemical names
+
+for (i in metab) {
+  met_label <- paste("met", seq(1:length(i)), sep = "")
+}
+
+rownames(metab) <- met_label
+
+#make an metabolite annotation table
+annot <- metab[, 1:12]
+
+#now isolate metabolite abundance data for analysis
+metab <- metab[, 13:36]
+
+#load sample metadata
+
+meta <- read.csv("feline_stab_meta.csv", header = T)
+
+str(meta)
+
+meta$Temp <- factor(meta$Temp, levels = c("-80C", "-20C"))
+
+meta$Time <- factor(meta$Time)
+
+rownames(meta) <- names(metab)
+
+#sanity check
+
+rownames(meta) == names(metab)
+
+sum(rownames(annot) == rownames(metab))
+
+#list of microbial metabolites and co-metabolites from Metabolon Inc.
+
+microbe <- read.csv("microbial_metabolites.csv", header = T)
+
+#log-transform
+
+metab_norm <- log10(metab)
+
+```
+
+How many serum metabolites were detected?
+
+```{r}
+nrow(annot)
+```
+
+Metabolites were measured across 8 super pathways. Examining the distribution of different metabolic super-pathways among the named metabolites, we find that lipids and amino acids are the most prevalent.
+
+```{r}
+table(annot$SUPER.PATHWAY)
+
+#length(unique(annot$SUPER.PATHWAY))
+```
+
+
+```{r}
+
+SuperPath <- as.data.frame(table(annot$SUPER.PATHWAY))
+
+names(SuperPath)[1] <- "SuperPathway"
+
+SuperPath <- SuperPath[order(-SuperPath$Freq), ]
+
+path.col <- viridis_pal()(nrow(SuperPath))
+
+names(path.col) <- SuperPath$SuperPathway
+
+super_plot <- ggplot(data = SuperPath, aes(y = Freq, x = reorder(SuperPathway, Freq), fill = SuperPathway)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_manual("Legend", values = path.col) +
+  xlab("") +
+  ylab("Number of Detected Metabolites") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = "none")  +
+  theme(axis.text.x=element_text(angle=45,hjust=1)) +
+  coord_flip() 
+
+super_plot + ggtitle("Number of Metabolites in Each Super-Pathway")
+
+
+```
+
+86 sub-pathways were identified, here are the top 20:
+
+```{r}
+
+#length(unique(annot$SUB.PATHWAY))
+
+SubPath <- as.data.frame(table(annot$SUB.PATHWAY))
+
+length(unique(SubPath$SubPathway))
+
+names(SubPath)[1] <- "SubPathway"
+
+SubPath <- SubPath[order(-SubPath$Freq), ]
+
+SubPath_top20 <- SubPath[1:50, ]
+
+SubPath_top20$SuperPath <- annot$SUPER.PATHWAY[match(SubPath_top20$SubPathway, annot$SUB.PATHWAY)]
+
+sub_plot <- ggplot(data = SubPath_top20, aes(y = Freq, x = reorder(SubPathway, Freq), 
+                                               fill = SuperPath)) + 
+  scale_fill_manual("Legend", values = path.col) +
+  geom_bar(stat = "identity") + 
+  labs(fill = "") +
+  xlab("") +
+  ylab("Number of Detected Metabolites") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x=element_text(angle=45,hjust=1)) +
+  theme(text = element_text(size = 8))+
+  coord_flip() 
+
+sub_plot + ggtitle("Metabolites in the Top 20 Sub-Pathways")
+
+```
+
+# **Unsupervised Analysis**
+
+## **Principal Component Analysis**
+
+PCA is a multivariate dimension reduction method that creates arbitrary independent variables (principal components) that are linear combinations of actual independent variables which explain the most variance in the data. The 1st PC always explains the most variance, with the amount of variance decreasing with each successive PC. When samples are plotted using PCA, the distance between two points is proportional to their similarity. Thus two samples that are separated along PC1 are different from each other and variables that explain the most variation along PC1 contribute most to the differences among samples. 
+
+Semi-layperson intro to PCA: https://towardsdatascience.com/a-one-stop-shop-for-principal-component-analysis-5582fb7e0a9c
+
+This is an unsupervised method and the sample/group annotation is added AFTER PCA is performed. This means that any trends observed from the PCA are the patterns that naturally exist in the data itself. 
+
+```{r, include=F}
+
+#make new df
+dat_pca <- data.frame(t(metab_norm))
+
+meta$condition <- paste(meta$Temp, meta$Time, sep = "_")
+
+dat_pca$condition <- meta$condition[match(rownames(dat_pca), rownames(meta))]
+
+dat_pca$ID <- meta$ID[match(rownames(dat_pca), rownames(meta))]
+
+dat_pca$condition <- as.factor(dat_pca$condition)
+dat_pca$ID <- as.factor(dat_pca$ID)
+
+
+dat_pca <- dat_pca[, c(735, 734, 1:733)]
+
+#perform PCA
+pca <- PCA(dat_pca[, 3:734], graph = F)
+
+#summary(pca)
+
+fviz_eig(pca)
+```
+
+```{r}
+dat_pca$condition <- factor(dat_pca$condition, 
+                              levels = c("-80C_12 Months", "-20C_6 Months", "-20C_12 Months"))
+
+#make a beautiful plot using ggplot2
+
+dat_pca$pc1 <- pca$ind$coord[, 1] # indexing the first column
+
+dat_pca$pc2 <- pca$ind$coord[, 2]  # indexing the second column
+
+pca.vars <- pca$var$coord %>% data.frame
+
+pca.vars$vars <- rownames(pca.vars)
+
+pca.vars.m <- melt(pca.vars, id.vars = "vars")
+
+pca_plot <- ggplot(data = dat_pca, aes(x = pc1, y = pc2, color = ID)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  guides(color = guide_legend(title = "ID")) +
+  geom_point(aes(shape = condition, color = ID), size = 5)
+
+pca_plot <- pca_plot +
+  xlab("PC 1 (23.994%)") + 
+  ylab("PC 2 (17.666%)") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), 
+        panel.border = element_rect(fill= "transparent")) +
+  theme(legend.position="right") + 
+  theme(legend.title=element_text(size=14), 
+    legend.text=element_text(size=12)) +
+  labs(color = "Cat ID", shape = "Storage Condition")
+
+pca_plot
+
+```
+It is clear that samples from individual cats cluster together, regardless of storage condition. In a couple of samples (cats 1, 5, 7) there is some separation of the -20C/12 months samples from the -80C and -20C/6 month samples. 
+
+Overall, the patterns is clear - replicate samples from individual cats are more similar to each other than samples from other cats. This is not surprising, as the origin of the sample with respect to individual cats is expected to to be the greatest driver of variation in serum metabolomes.
+
+```{r, include=F}
+#can be useful for pulling out features that explain X amount of variance
+pca_cumvar <- data.frame(pca$var$contrib)
+
+pca_cumvar <- pca_cumvar[order(-pca_cumvar$Dim.1), ]
+
+pca_cumvar$cumsum1 <- cumsum(pca_cumvar$Dim.1)
+
+```
+
+## **Heatmap of Metabolite Abundance**
+
+Heatmapping is another unsupervised method to reveal trends in large datasets. The intensity of color in each cell represents the (z-scaled) abundance of each metabolite in each sample. The rows are organized by hierarchical clustering of the euclidian distance between all pair-wise combinations of variables or samples. Similar to PCA, hierarchical clustering will place similar samples/features near each other and dissimilar samples/features away from each other. 
+
+```{r}
+
+meta$new_ID <- paste(meta$ID, meta$condition, sep = "_")
+
+annotation_colors <- list(Group = 
+                            c(`-80C_12 Months` = "blue", 
+                              `-20C_6 Months` = "green", 
+                              `-20C_12 Months` = "purple"))
+
+annotation_col <- as.data.frame(meta[, 5])
+
+names(annotation_col)[1] <- "Condition"
+
+rownames(annotation_col) <- meta$new_ID
+
+#I get en error about infinite values when making the heatmap, this gets rid of it
+metab_heat <- metab_norm[apply(metab_norm, MARGIN = 1, FUN = function(x) sd(x) != 0),]
+
+table(rownames(meta) == names(metab_heat))
+
+names(metab_heat) <- meta$new_ID
+
+heat_plot <- pheatmap(
+  mat               = metab_heat,
+  color             = inferno(10),
+  border_color      = NA,
+  show_colnames     = T,
+  show_rownames     = FALSE,
+  annotation_col    = annotation_col,
+  annotation_colors = annotation_colors,
+  cluster_cols = T,
+  drop_levels       = TRUE,
+  scale             = "row",
+  fontsize          = 12,
+  fontsize_col = 6,
+  annotation_legend = T
+)
+
+heat_plot
+
+```
+
+Clearly, the individual cat is the largest driver of variation among samples. There is no clear clustering by storage condition and samples from each cat cluster near each other. 
+
+Based on unsupervised analysis, serum metabolomes from healthy cats are globally similar regardless of samples storage conditions. 
+
+# **Hypothesis Testing**
+
+I will use a repeated measures ANOVA to detect whether there are significant differences in serum metabolite abundance among the three storage conditions. The metabolites abundance data were previously median-centered and log-transformed. This was implemented using MetaboAnalyst
+
+
+```{r}
+#for MdtaboAnalyst
+
+metab_MA <- metab_lm
+
+names(metab_MA)[2] <- "Time"
+
+metab_MA <- metab_MA[order(metab_MA$ID, metab_MA$Time), ]
+
+metab_MA <- metab_MA[,-1 ]
+
+write.csv(metab_MA, "metab_MA.csv")
+```
+
+
+```{r}
+#MetaboAnalyst Results
+
+annova_MA <- read.csv("anova_posthoc.csv")
+
+annova_MA$Biochemical <- annot$BIOCHEMICAL[match(annova_MA$X, rownames(annot))]
+
+annova_MA$SuperPathway <- annot$SUPER.PATHWAY[match(annova_MA$X, rownames(annot))]
+
+annova_MA$SubPathway <- annot$SUB.PATHWAY[match(annova_MA$X, rownames(annot))]
+
+sig_names <-  as.character(unique(annova_MA$X))
+
+rownames(annova_MA) <- annova_MA$X
+
+annova_MA <- annova_MA[, c(7:9, 2:3, 5:6)]
+
+annova_MA <- annova_MA[order(annova_MA$SuperPathway, 
+                             annova_MA$SubPathway,
+                             annova_MA$p.value), ]
+
+write.csv(annova_MA, "ANOVA_res.csv")
+
+```
+
+How many metabolites were found to vary significantly by storage condition?
+
+```{r}
+nrow(annova_MA)
+```
+
+```{r}
+
+class(annova_MA$Tukey.s.HSD)
+
+tukeys <- data.frame(t(strsplit(annova_MA$Tukey.s.HSD, ";")))
+```
+
+
+```{r, include=F}
+
+sig_metab <- data.frame(t(metab_norm), check.names = F)
+
+# #for some reason there are NAs in this vector, remove
+# sig_names<-sig_names[!sig_names == "NA.1"]
+# sig_names<-sig_names[!sig_names == "NA"]
+
+sig_metab <- sig_metab %>% select(sig_names)
+
+table(names(sig_metab) == sig_names)
+
+names(sig_metab) <- annot$BIOCHEMICAL[match(names(sig_metab), rownames(annot))] 
+
+sig_metab$Condition <- meta$condition[match(rownames(sig_metab), rownames(meta))] 
+
+sig_metab$Condition <- factor(sig_metab$Condition, 
+                              levels = c("-80C_12 Months", "-20C_6 Months", "-20C_12 Months"))
+
+
+sig_metab$Condition <- revalue(sig_metab$Condition, 
+                               c("-80C_12 Months"="-80C_12", 
+                                 "-20C_6 Months"="-20C_6",
+                                 "-20C_12 Months"="-20C_12"))
+
+
+
+cols <- c("red", "blue", "purple")
+
+my_comparisons <- list(c("-80C_12", "-20C_6"), 
+                        c("-80C_12", "-20C_12"), 
+                        c("-20C_6", "-20C_12"))
+
+base_plot <-sig_metab %>%
+  gather(Measure, Value, -Condition) %>%
+  ggplot(aes(x = factor(Condition), y = Value, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter()  +
+  theme(plot.title = element_text(size = 6)) +
+  scale_fill_manual(values = cols) +
+  facet_wrap(~Measure, 
+             scales = "free") +
+  xlab("Storage Condition") +
+  ylab("Metabolite Abundance (Median-Scaled))") +
+  stat_compare_means(comparisons = my_comparisons, 
+                     label = "p.signif", 
+                     method = "t.test", 
+                     p.adjust.method = "BH") +  
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+pdf("S_Fig_sigBoxplots2.pdf")
+facet_multiple(base_plot, "Measure",
+               nrow = ,
+               ncol = 2,
+               scales = "free")
+dev.off()
+
+```
+
+
+Plots of gamma-glutamyl amino acids and glutathione metabolites:
+
+```{r}
+
+unique(annova_MA$SubPathway)
+
+ggaa_glut_names <- annova_MA[annova_MA$SubPathway == "Glutathione Metabolism" 
+                             | 
+                               annova_MA$SubPathway == "Gamma-glutamyl Amino Acid" 
+                             | 
+                               annova_MA$SuperPathway == "Amino Acid", 
+                             ]
+
+sig_names2 <- rownames(ggaa_glut_names)
+```
+
+```{r, include=F}
+
+sig_metab2 <- data.frame(t(metab_norm), check.names = F)
+
+# #for some reason there are NAs in this vector, remove
+# sig_names<-sig_names[!sig_names == "NA.1"]
+# sig_names<-sig_names[!sig_names == "NA"]
+
+sig_metab2 <- sig_metab2 %>% select(sig_names2)
+
+table(names(sig_metab2) == sig_names2)
+
+names(sig_metab2) <- annot$BIOCHEMICAL[match(names(sig_metab2), rownames(annot))] 
+
+sig_metab2$Condition <- meta$condition[match(rownames(sig_metab2), rownames(meta))] 
+
+sig_metab2$Condition <- factor(sig_metab2$Condition, 
+                              levels = c("-80C_12 Months", 
+                                         "-20C_6 Months", 
+                                         "-20C_12 Months"))
+
+
+sig_metab2$Condition <- revalue(sig_metab2$Condition, 
+                               c("-80C_12 Months"="-80C_12", 
+                                 "-20C_6 Months"="-20C_6",
+                                 "-20C_12 Months"="-20C_12"))
+
+
+
+cols <- c("red", "blue", "purple")
+
+my_comparisons <- list(c("-80C_12", "-20C_6"), 
+                        c("-80C_12", "-20C_12"), 
+                        c("-20C_6", "-20C_12"))
+
+base_plot <-sig_metab2 %>%
+  gather(Measure, Value, -Condition) %>%
+  ggplot(aes(x = factor(Condition), y = Value, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter()  +
+  theme(plot.title = element_text(size = 6)) +
+  scale_fill_manual(values = cols) +
+  facet_wrap(~Measure, 
+             scales = "free") +
+  xlab("Storage Condition") +
+  ylab("Metabolite Abundance (Median-Scaled))") +
+  stat_compare_means(comparisons = my_comparisons, 
+                     label = "p.signif", 
+                     method = "t.test", 
+                     p.adjust.method = "BH") +  
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position="none") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) 
+
+tiff("S_Fig_sigBoxplots3.tiff", height = 22, width = 19, units = "cm", res = 600)
+facet_multiple(base_plot, "Measure",
+               scales = "free")
+dev.off()
+
+# tiff("boxplots.tiff", height = 22, width = 19, units = "cm", res = 600)
+# base_plot
+# dev.off()
+
+figure <- ggarrange(base_plot,
+                    labels = c("A", "B", "C"),
+                    ncol = 3, nrow = 4)
+
+```
+
+# **Intraclass Correlation Analysis**
+
+Intraclass correlation (ICC) analysis is used to quantify the degree to which samples with a fixed degree of relatedness (e.g. same storage condition) resemble each other in terms of a quantitative trait. I will use to to detect metabolites that vary significantly among samples that were collected from the same cats but exposed to different srtorage conditions. 
+
+Metabolites with a ICC approaching 1 have very litte variance among different sotrage conditions. I will use the following scheme to rank metabolites based on ICC:
+
+ - ICC < 0.5: Poor stability across storage conditions  
+ - ICC 0.5 - 0.74: Fair stability across storage conditions  
+ - ICC 0.7 - 0.9: Moderate stability across storage conditions  
+ - ICC > 0.9: Excellent stability across storage conditions  
+ - A negative ICC will be interpreted as measures of the same metabolite over time being less similar than any two metabolites chosen randomly of the entire data.  
+ 
+ Other investigators have used a similar approach:
+
+ - https://doi.org/10.1371/journal.pone.0021103
+ - https://doi.org/10.1371/journal.pone.0218549
+ - https://doi.org/10.1038/s41598-020-72914-7
+ - https://cebp.aacrjournals.org/content/cebp/25/11/1483.full.pdf
+
+
+```{r, include=F}
+metab_icc <- data.frame(t(metab_norm))
+
+metab_icc$ID <- meta$ID[match(rownames(meta), rownames(metab_icc))]
+
+metab_icc$ID <- as.factor(metab_icc$ID)
+
+metab_icc <- metab_icc[, c(734, 1:733)]
+
+metab_icc$ID <- as.factor(metab_icc$ID)
+```
+
+```{r, include=F}
+#Loop to iterate intraclass correlation coefficient function over entire dataset (once per metabolite)
+
+names <- colnames(metab_icc)[2:734]
+
+icc_df <- NULL
+
+for (i in names) {
+  
+  icc <- data.frame(ICCest(ID, i, data = metab_icc, CI.type = "S"))
+  
+  name <- i
+  
+  df <- data.frame(cbind(name, icc))
+  
+  icc_df <- data.frame(rbind(icc_df, df))
+  
+}
+
+icc_df$Biochemical <- annot$BIOCHEMICAL[match(icc_df$name, rownames(annot))] 
+
+icc_df$SubPathway <- annot$SUB.PATHWAY[match(icc_df$name, rownames(annot))] 
+
+icc_df$SuperPathway <- annot$SUPER.PATHWAY[match(icc_df$name, rownames(annot))] 
+
+icc_df <- icc_df[, c(9:11, 2:8)]
+```
+
+How many metabolites had excellent stability?
+```{r}
+
+total <- nrow(icc_df)
+excellent <- length(which(icc_df$ICC > 0.9))
+
+paste(excellent, "(", 100* round(excellent/total, 2), "%",") of metabolites had excellent stability")
+
+
+```
+
+How many metabolites had moderate stability?
+```{r}
+
+moderate <- length(which(icc_df$ICC > 0.75 & icc_df$ICC < 0.9))
+
+paste(moderate, "(", 100*round(moderate/total, 2), "%",") of metabolites had moderate stability")
+
+
+```
+
+
+How many metabolites had fair stability?
+```{r}
+
+fair <- length(which(icc_df$ICC > 0.5 & icc_df$ICC < 0.75))
+
+paste(fair, "(", 100*round(fair/total, 2), "%",") of metabolites had fair stability")
+
+```
+
+
+How many metabolites had poor stability?
+```{r}
+
+poor <- icc_df[which(icc_df$ICC < 0.5), ]
+
+
+paste(nrow(poor), "(", 100*round(nrow(poor)/total, 2), "%",") of metabolites had poor stability")
+
+
+poor <- poor[order(poor$SuperPathway, poor$SubPathway, poor$ICC), ]
+
+```
+
+```{r}
+icc_df$Stability <- case_when(
+  icc_df$ICC >= 0.9 ~ "Excellent",
+  icc_df$ICC >= 0.75 & icc_df$ICC < 0.9 ~ "Moderate",
+  icc_df$ICC >=0.5 & icc_df$ICC < 0.75 ~ "Fair",
+  icc_df$ICC < 0.5 ~ "Poor"
+)
+
+stability <- data.frame(table(icc_df$Stability))
+
+names(stability)[1] <- "Metabolite Stability"
+
+```
+
+```{r}
+stability$`Metabolite Stability` <- factor(stability$`Metabolite Stability`, 
+                                           levels = c("Poor", "Fair", "Moderate", "Excellent"))
+
+ggplot(data = stability, aes(y = Freq, x = `Metabolite Stability`)) + 
+  geom_bar(stat = "identity", color = "black", fill = "lightblue") + 
+  labs(fill = "") +
+  xlab("Intraclass Correlation-Based Metabolite Stability") +
+  ylab("Number of Metabolites") + 
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = "none")  +
+  theme(axis.text.x=element_text(angle=45,hjust=1)) +
+  coord_flip() +
+  ggtitle("Intraclass Correlation Analysis: Metabolite Stability")
+```
+
+
+# **Enrichment Analysis**
+
+```{r, include=F}
+##rank metabolites by the product of the log2FC and log(p-val)
+#this generates a vector of metabolites ranked according a metric derived from significance testing
+#the top end of the list are highly significant AND have high positive fold change
+#the bottem end of the list are highly significant AND have negative fold change
+
+diff_enrich <- icc_df[, 1:4]
+
+# diff_enrich <- diff_enrich[diff_enrich$log2FoldChange < -1 | diff_enrich$log2FoldChange > 1, ]
+
+diff_enrich <- diff_enrich[order(diff_enrich$ICC, decreasing = T), ]
+
+#create ranking vector from product of log2FC*pval
+
+rank <- diff_enrich[, 4]
+names(rank) <- diff_enrich$Biochemical
+# head(rank)
+# tail(rank)
+
+#Now generate lists of metabolites in each metabolic sub-pathway
+
+pathways <- diff_enrich[, 1:3]
+
+pathways <- pathways[order(pathways$SubPathway, pathways$Biochemical),]
+
+#pathways$Biochemical <- as.character(pathways$Biochemical)
+pathways$SubPathway <- as.character(pathways$SubPathway)
+
+pathways <- split(pathways$Biochemical, as.character(pathways$SubPathway))
+
+class(pathways)
+
+fgseaRes <- fgsea(pathways = pathways, 
+                  stats = rank,
+                  minSize=2,
+                  maxSize=500,
+                  nperm=100000)
+
+fgseaRes$SuperPathway <- annot$SUPER.PATHWAY[match(fgseaRes$pathway, annot$SUB.PATHWAY)]
+
+fgseaRes_out <- data.frame(fgseaRes)
+
+fgseaRes_out <- apply(fgseaRes_out,2,as.character)
+
+  
+# plotEnrichment(pathways[[head(fgseaRes[order(pval), ], 1)$pathway]],
+#                rank) + labs(title=head(fgseaRes[order(pval), ], 1)$pathway)
+
+fgsea
+write.csv(fgseaRes_out, file = "fgseaRes.csv")
+
+
+```
+
+```{r}
+
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=20), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+
+topPathways <- unlist(topPathways)
+
+fgseaRes_top20 <- fgseaRes[fgseaRes$pathway %in% topPathways, ]
+
+fgseaRes_top20 <- fgseaRes_top20[order(fgseaRes_top20$NES), ]
+
+fgseaRes_top20$pathway <- as.factor(fgseaRes_top20$pathway)
+
+fgseaRes_top20$pathway <- factor(fgseaRes_top20$pathway, 
+                                 levels = fgseaRes_top20$pathway[order(fgseaRes_top20$NES)])
+
+gsea_plot <- ggplot(data = fgseaRes_top20, aes(y = fgseaRes_top20$NES, 
+                                               x = fgseaRes_top20$pathway, 
+                                               fill = ifelse(fgseaRes_top20$padj <0.2, 
+                                                             "P<0.05", "P≥0.05"))) +
+  geom_bar(stat = "identity", position = "dodge") + ylim(-4, 4) + coord_flip()
+
+gsea_plot <- gsea_plot + 
+  labs(fill = "") +
+  xlab("") +
+  ylab("Normalized Enrichment Score") + scale_fill_manual(values=c("orange", "grey")) + 
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = "right") + theme(legend.title.align=0.5)
+      
+gsea_plot + ggtitle("Pathway Enrichment Analysis: \nMetabolite Stability")
+
+
+```
+
+# **Random Forest Analysis**
+
+```{r}
+
+metab_rf <- metab_icc[-1, ]
+
+metab_rf$condition <- meta$condition[match(rownames(metab_rf), rownames(meta))]
+
+metab_rf$condition <- factor(metab_rf$condition)
+
+rf <- randomForest(
+  condition ~ .,
+  data=metab_rf
+)
+
+rf
+
+my_table <- data.frame(rf$confusion, check.names = F)
+my_table
+
+```
+
+```{r}
+
+library(ggpmisc)
+
+rf_importance <- data.frame(rf$importance)
+
+rf_importance$Biochemical <- annot$BIOCHEMICAL[match(rownames(rf_importance), rownames(annot))] 
+
+rf_importance <- data.frame(rf_importance[order(rf_importance$MeanDecreaseGini, decreasing = T), ])
+
+rf_top20 <- rf_importance[1:20, ]
+
+rf_top20$Biochemical <- factor(rf_top20$Biochemical, 
+                                 levels = rf_top20$Biochemical[order(rf_top20$MeanDecreaseGini,
+                                                                     decreasing = F)])
+
+names(my_table) <- c("-20C_12", "-20C_6", "-80C", "Error")
+
+rownames(my_table) <- c("-20C_12", "-20C_6", "-80C")
+
+my_table$Error <- round(my_table$Error, 2)
+
+my_table$Actual <- rownames(my_table)
+
+my_table <- my_table[, c(5, 1:4)]
+
+names(my_table)[1] <- ""
+
+rf_plot <- ggplot(data = rf_top20, aes(y = rf_top20$MeanDecreaseGini, 
+                                               x = rf_top20$Biochemical)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "orange") + coord_flip()
+
+rf_plot <- rf_plot + 
+  labs(fill = "") +
+  xlab("") +
+  ylab("Mean Decrease Accuracy") +  
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = "right") + theme(legend.title.align=0.5) +
+  annotate(geom = "table", x = 6, y = 0.25, label = list(my_table), 
+           vjust = 1, hjust = 0)+
+  ggtitle("Random Forest: Top 20 Features")
+
+rf_plot + annotate(geom = "text", x = 6.5, y = 0.42, label = "Confusion Matrix", , fontface =2) +
+  annotate(geom = "text", x = 1.3, y = 0.42, label = "OOB Error = 39.13%", size = 3)
+
+  
+grob <- tableGrob(my_table, theme = ttheme_minimal(base_size = 5))
+
+ggarrange(rf_plot, grob, nrow = 1, ncol = 2)
+
+rf_plot + annotation_custom(grob, ymin=0.4, xmax = 2)
+```
+
+```{r, include=F}
+
+sig_metab <- data.frame(t(metab_norm), check.names = F)
+
+sig_names <-  as.character(rownames(rf_top20))
+
+# #for some reason there are NAs in this vector, remove
+# sig_names<-sig_names[!sig_names == "NA.1"]
+# sig_names<-sig_names[!sig_names == "NA"]
+
+sig_names
+
+sig_metab <- sig_metab %>% select(sig_names)
+
+names(sig_metab) == sig_names
+
+names(sig_metab) <- annot$BIOCHEMICAL[match(names(sig_metab), rownames(annot))] 
+
+sig_metab$Condition <- meta$condition[match(rownames(sig_metab), rownames(meta))] 
+
+sig_metab$Condition <- factor(sig_metab$Condition, 
+                              levels = c("-80C_12 Months", "-20C_6 Months", "-20C_12 Months"))
+
+sig_metab$Condition <- revalue(sig_metab$Condition, 
+                               c("-80C_12 Months"="-80C_12", 
+                                 "-20C_6 Months"="-20C_6",
+                                 "-20C_12 Months"="-20C_12"))
+
+
+
+cols <- c("red", "blue", "purple")
+
+my_comparisons <- list(c("-80C_12", "-20C_6"), 
+                        c("-80C_12", "-20C_12"), 
+                        c("-20C_6", "-20C_12"))
+
+base_plot <-sig_metab %>%
+  gather(Measure, Value, -Condition) %>%
+  ggplot(aes(x = factor(Condition), y = Value, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter()  +
+  theme(plot.title = element_text(size = 6)) +
+  scale_fill_manual(values = cols) +
+  facet_wrap(~Measure, 
+             scales = "free_y") +
+  xlab("Storage Condition") +
+  ylab("Metabolite Abundance (Median-Scaled))") +
+  stat_compare_means(comparisons = my_comparisons, p.adjust.method = "BH") +  
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+pdf("S_Fig_sigBoxplots.pdf")
+facet_multiple(base_plot, "Measure",
+               nrow = ,
+               ncol = 2,
+               scales = "free_y")
+dev.off()
+
+```
+
