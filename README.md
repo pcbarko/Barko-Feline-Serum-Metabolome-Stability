@@ -1,11 +1,8 @@
 # Barko-Feline-Serum-Metabolome-Stability
 
-The R code in this repository can be used to replicate the analysis in a manuscript that is currently under review by PLoS ONE: 
+The R code in this repository can be used to replicate the analysis in a manuscript has been submitted to PLOS ONE.
 
-"Untargeted Metabolomics Reveals the Effects of Pre-Analytic Storage Conditions on Serum Metabolite Profiles in Cats"
+Untargeted metabolomics reveals the effects of pre-analytic storage on serum metabolite profiles from healthy cats 
 
-The data is present in our Mendeley Data repository: 
-
-Barko, Patrick (2022), “Untargeted Metabolomics Reveals the Effects of Pre-Analytic Storage Conditions on Serum Metabolite Profiles in Cats”, Mendeley Data, V1, doi: 10.17632/bkw33tpg36.1
 
 
